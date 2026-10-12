@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import operator
+import re
 import os
+import time
 import requests
 from datetime import date, timedelta
 from pathlib import Path
@@ -17,8 +20,8 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 
 from langchain_openrouter import ChatOpenRouter
 
-import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from langgraph.checkpoint.postgres import PostgresSaver
 from dotenv import load_dotenv
 import os 
@@ -116,6 +119,10 @@ class GlobalImagePlan(BaseModel):
 class State(TypedDict):
     topic: str
 
+    # chosen LLM
+    provider: str
+    model: str
+
     # routing / research
     mode: str
     needs_research: bool
@@ -134,10 +141,73 @@ class State(TypedDict):
     final: str
 
 
-llm = ChatOpenRouter(
-    model="nvidia/nemotron-3-ultra-550b-a55b:free",
-    temperature=0,
-)
+# -----------------------------
+# LLM providers / free models
+# -----------------------------
+MODEL_CATALOG = {
+    "openrouter": {
+        "label": "OpenRouter",
+        "env": "OPENROUTER_API_KEY",
+        "models": [
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "openai/gpt-oss-120b:free",
+            "openai/gpt-oss-20b:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+        ],
+    },
+    "gemini": {
+        "label": "Google Gemini",
+        "env": "GOOGLE_API_KEY",
+        "models": [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
+        ],
+    },
+    "groq": {
+        "label": "Groq",
+        "env": "GROQ_API_KEY",
+        "models": [
+            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3-32b",
+        ],
+    },
+}
+
+DEFAULT_PROVIDER = "openrouter"
+DEFAULT_MODEL = MODEL_CATALOG[DEFAULT_PROVIDER]["models"][0]
+
+_llm_cache: dict = {}
+def get_models(provider: str) -> List[str]:
+    return MODEL_CATALOG[provider]["models"]
+
+
+def get_llm(provider: Optional[str] = None, model: Optional[str] = None):
+    """Build (and cache) the chat model for the chosen provider/model."""
+    provider = provider or DEFAULT_PROVIDER
+    if provider not in MODEL_CATALOG:
+        raise ValueError(f"Unknown provider: {provider}")
+    model = model or get_models(provider)[0]
+    if model not in get_models(provider):
+        raise ValueError(f"Model '{model}' is not available for provider '{provider}'.")
+
+    key = (provider, model)
+    if key not in _llm_cache:
+        if provider == "openrouter":
+            _llm_cache[key] = ChatOpenRouter(model=model, temperature=0)
+        elif provider == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            _llm_cache[key] = ChatGoogleGenerativeAI(model=model, temperature=0)
+        else:
+            from langchain_groq import ChatGroq
+            _llm_cache[key] = ChatGroq(model=model, temperature=0)
+    return _llm_cache[key]
+
+
+def llm_for(state_or_payload) -> object:
+    return get_llm(state_or_payload.get("provider"), state_or_payload.get("model"))
 
 
 # -----------------------------
@@ -164,7 +234,7 @@ If needs_research=true:
 def router_node(state: State) -> dict:
     
     topic = state["topic"]
-    decider = llm.with_structured_output(RouterDecision)
+    decider = llm_for(state).with_structured_output(RouterDecision)
     decision = decider.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
@@ -234,7 +304,7 @@ def research_node(state: State) -> dict:
     if not raw_results:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
+    extractor = llm_for(state).with_structured_output(EvidencePack)
     pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
@@ -293,7 +363,7 @@ Output must strictly match the Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
+    planner = llm_for(state).with_structured_output(Plan)
 
     evidence = state.get("evidence", [])
     mode = state.get("mode", "closed_book")
@@ -325,6 +395,8 @@ def fanout(state: State):
                 "task": task.model_dump(),
                 "topic": state["topic"],
                 "mode": state["mode"],
+                "provider": state.get("provider"),
+                "model": state.get("model"),
                 "plan": state["plan"].model_dump(),
                 "evidence": [e.model_dump() for e in state.get("evidence", [])],
             },
@@ -388,7 +460,7 @@ def worker_node(payload: dict) -> dict:
             for e in evidence[:20]
         )
 
-    section_md = llm.invoke(
+    response = llm_for(payload).invoke(
         [
             SystemMessage(content=WORKER_SYSTEM),
             HumanMessage(
@@ -412,7 +484,19 @@ def worker_node(payload: dict) -> dict:
                 )
             ),
         ]
-    ).content.strip()
+    )
+
+    content = response.content
+    if isinstance(content, list):  # content blocks (some providers/reasoning models)
+        content = "".join(
+            b if isinstance(b, str) else b.get("text", "")
+            for b in content
+            if isinstance(b, (str, dict)) and (isinstance(b, str) or b.get("type") == "text")
+        )
+    section_md = (content or "").strip()
+
+    if not section_md:
+        raise RuntimeError(f"LLM returned an empty section for task {task.id}: {task.title}")
 
     return {"sections": [(task.id, section_md)]}
 
@@ -431,6 +515,8 @@ def merge_content(state: State) -> dict:
 
     ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
     body = "\n\n".join(ordered_sections).strip()
+    if not body:
+        raise RuntimeError("No section content was produced by the workers.")
     merged_md = f"# {plan.blog_title}\n\n{body}\n"
     return {"merged_md": merged_md}
 
@@ -449,7 +535,7 @@ Return strictly GlobalImagePlan.
 
 def decide_images(state: State) -> dict:
     
-    planner = llm.with_structured_output(GlobalImagePlan)
+    planner = llm_for(state).with_structured_output(GlobalImagePlan)
     merged_md = state["merged_md"]
     plan = state["plan"]
     assert plan is not None
@@ -468,41 +554,74 @@ def decide_images(state: State) -> dict:
         ]
     )
 
-    return {
-        "md_with_placeholders": image_plan.md_with_placeholders,
-        "image_specs": [img.model_dump() for img in image_plan.images],
-    }
+    specs = [img.model_dump() for img in image_plan.images][:3]
+    md = image_plan.md_with_placeholders or ""
+
+    # The LLM must re-emit the whole article; weaker models often return a truncated
+    # text (e.g. only the title). Reject it and place the placeholders ourselves.
+    intact = len(md) >= 0.8 * len(merged_md) and all(s["placeholder"] in md for s in specs)
+    if not intact:
+        md = _insert_placeholders(merged_md, [s["placeholder"] for s in specs])
+
+    return {"md_with_placeholders": md, "image_specs": specs}
+
+
+def _insert_placeholders(md: str, placeholders: List[str]) -> str:
+    """Spread placeholders evenly after the sections of the original Markdown."""
+    if not placeholders:
+        return md
+    parts = re.split(r"(?m)^(?=## )", md)  # parts[0] = title/intro, then one per section
+    sections = len(parts) - 1
+    if sections < 1:
+        return md + "\n\n" + "\n\n".join(placeholders) + "\n"
+    for i, ph in enumerate(placeholders):
+        idx = 1 + min(sections - 1, (i * sections) // len(placeholders))
+        parts[idx] = parts[idx].rstrip() + f"\n\n{ph}\n\n"
+    return "".join(parts)
 
 
 def _cloud_flare_generate_image_bytes(prompt: str) -> bytes:
-    """
-    Returns raw image bytes generated by Cloudflare Workers AI.
-    Requires: pip install requests
-    Env var: CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN
-    """
     account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
     api_token = os.environ.get("CLOUDFLARE_API_TOKEN")
 
     if not account_id or not api_token:
         raise RuntimeError("CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN is not set.")
 
-    model = "@cf/black-forest-labs/flux-1-schnell"
+    model = "@cf/black-forest-labs/flux-2-klein-9b"
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 
+    # On ne met pas de Content-Type ici. "requests" le définira automatiquement 
+    # en multipart/form-data avec le bon boundary grâce au paramètre "files".
     headers = {
         "Authorization": f"Bearer {api_token}"
     }
     
-    payload = {
-        "prompt": prompt
+    # Format multipart requis par l'API de FLUX.2 [dev]
+    form = {
+        "prompt": (None, prompt),
+        "width": (None, "1024"),
+        "height": (None, "1024"),
     }
 
-    response = requests.post(url, headers=headers, json=payload)
+    # Utilisation de 'files' pour générer une requête multipart
+    response = None
+    for attempt in range(3):  # Cloudflare sometimes answers with a transient 5xx
+        response = requests.post(url, headers=headers, files=form, timeout=180)
+        if response.status_code < 500:
+            break
+        time.sleep(2 * (attempt + 1))
 
-    if response.status_code == 200:
-        return response.content
-    else:
+    if response.status_code != 200:
         raise RuntimeError(f"Cloudflare API Error ({response.status_code}): {response.text}")
+
+    # Récupération de la sortie (Output) qui est un Base64 string selon la doc
+    data = response.json()
+    image_b64 = data.get("result", {}).get("image")
+    
+    if not image_b64:
+        raise RuntimeError(f"Cloudflare returned no image: {str(data)[:300]}")
+        
+    return base64.b64decode(image_b64)
 
 
 def generate_and_place_images(state: State) -> dict:
@@ -515,8 +634,6 @@ def generate_and_place_images(state: State) -> dict:
 
     # If no images requested, just write merged markdown
     if not image_specs:
-        filename = f"{plan.blog_title}.md"
-        Path(filename).write_text(md, encoding="utf-8")
         return {"final": md}
 
     images_dir = Path("images")
@@ -546,8 +663,6 @@ def generate_and_place_images(state: State) -> dict:
         img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
-    filename = f"{plan.blog_title}.md"
-    Path(filename).write_text(md, encoding="utf-8")
     return {"final": md}
 
 
@@ -593,13 +708,28 @@ g.add_edge("reducer", END)
 # =========================
 DATABASE_URL = get_database_url()
 
-_conn = psycopg.connect(
-    DATABASE_URL,
-    autocommit=True,
-    row_factory=dict_row
+# A single long-lived connection gets dropped by Supabase (idle during slow steps such as
+# image generation) or on network blips. A pool tests connections before handing them out
+# and replaces dead ones; TCP keepalives stop idle connections from being cut.
+_pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=10,
+    max_idle=120,
+    check=ConnectionPool.check_connection,
+    kwargs={
+        "autocommit": True,
+        "row_factory": dict_row,
+        "prepare_threshold": None,  # required behind Supabase/pgbouncer poolers
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    },
+    open=True,
 )
 
-checkpointer = PostgresSaver(_conn)
+checkpointer = PostgresSaver(_pool)
 checkpointer.setup()
 
 
